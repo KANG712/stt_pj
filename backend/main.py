@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from faster_whisper import WhisperModel
 
-app = FastAPI(title="Field Manager STT Backend", version="1.1.0")
+app = FastAPI(title="Field Manager STT Backend", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,15 +20,22 @@ app.add_middleware(
 )
 
 _model: Optional[WhisperModel] = None
+_model_load_error: Optional[str] = None
 
 
 def get_model() -> WhisperModel:
     global _model
+    global _model_load_error
 
     if _model is None:
         model_size = os.getenv("WHISPER_MODEL_SIZE", "small")
         device = os.getenv("WHISPER_DEVICE", "cpu")
         compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+
+        print(
+            f"[MODEL] loading model: size={model_size}, device={device}, compute_type={compute_type}",
+            flush=True,
+        )
 
         _model = WhisperModel(
             model_size_or_path=model_size,
@@ -36,7 +43,22 @@ def get_model() -> WhisperModel:
             compute_type=compute_type,
         )
 
+        _model_load_error = None
+        print("[MODEL] model loaded successfully", flush=True)
+
     return _model
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    global _model_load_error
+
+    try:
+        get_model()
+    except Exception as e:
+        _model_load_error = str(e)
+        print(f"[STARTUP ERROR] model preload failed: {_model_load_error}", flush=True)
+        raise RuntimeError(f"model preload failed: {_model_load_error}")
 
 
 def normalize_text(text: str) -> str:
@@ -55,6 +77,7 @@ def normalize_datetime_text(text: str) -> str:
         "시": ":",
         "분": "",
     }
+
     for old, new in replacements.items():
         value = value.replace(old, new)
 
@@ -111,8 +134,9 @@ def root() -> dict:
 @app.get("/health")
 def health() -> dict:
     return {
-        "status": "ok",
+        "status": "ok" if _model_load_error is None else "error",
         "model_loaded": _model is not None,
+        "model_load_error": _model_load_error,
         "model_size": os.getenv("WHISPER_MODEL_SIZE", "small"),
         "device": os.getenv("WHISPER_DEVICE", "cpu"),
         "compute_type": os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
@@ -126,6 +150,14 @@ async def transcribe(
     language: str = Form("ko"),
     beam_size: int = Form(5),
 ) -> dict:
+    global _model_load_error
+
+    if _model_load_error is not None:
+        raise HTTPException(
+            status_code=500,
+            detail=f"model preload failed: {_model_load_error}",
+        )
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="audio file is missing")
 
@@ -165,6 +197,8 @@ async def transcribe(
             "language_probability": info.language_probability,
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"transcription failed: {e}")
 
